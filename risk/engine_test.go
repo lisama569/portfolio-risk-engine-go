@@ -96,8 +96,8 @@ func TestIncrementalVsFullConsistency(t *testing.T) {
 		}
 	}
 	t.Logf("输入快照: 增量序列=%d 条, 另混入重复 seq=2 与乱序 seq=1", len(quotes))
-	inc.ApplyQuotes(quote("AAA", 101, 2, base.Add(time.Minute)))  // 重复
-	inc.ApplyQuotes(quote("AAA", 99, 1, base))                    // 乱序
+	inc.ApplyQuotes(quote("AAA", 101, 2, base.Add(time.Minute))) // 重复
+	inc.ApplyQuotes(quote("AAA", 99, 1, base))                   // 乱序
 	// 全量：一次性装载
 	full.ApplyQuotes(quotes...)
 

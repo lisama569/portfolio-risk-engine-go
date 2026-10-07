@@ -9,6 +9,7 @@
 | `market` | 行情类型、线程安全行情库（`Store`）、行情校验与拒绝原因 |
 | `portfolio` | 持仓定义、市值估值、权重归一化 |
 | `risk` | VaR/ES 计量（历史模拟、参数法）、风险引擎（`Engine`）、压力情景 |
+| `backtest` | 沿时间轴的历史回放、逐时点风险序列、模型回测（突破统计）与多组合隔离 |
 
 ## 风险模型口径
 
@@ -54,11 +55,82 @@
 | `DUPLICATE_SEQ` | 重复序号 | 幂等忽略 |
 | `OUT_OF_ORDER` | 序号倒退 | 拒绝 |
 
+## 历史回放与模型回测（`backtest`）
+
+在当期风险计量之上，新增一层沿时间轴推进的历史回放与回测，用来判断所选口径在不同市场阶段是否可信。
+
+### 输入与口径
+- 输入为**严格递增**的时间轴 `[]Point`；每个 `Point` 含：时点 `AsOf`、该时点已知的行情 `Quotes`、各标的**当期已实现收益** `RealizedReturn`（该时点所覆盖区间内实际发生的收益）。
+- 配置 `Config`：
+  - `Methods`：计量口径（`historical` / `parametric`，可多个，结论按口径分别给出）；
+  - `Confidence`：VaR/ES 置信水平；
+  - `MinHistory`：预热所需最少**干净历史收益样本数**（不足则该时点跳过，默认 1）；
+  - `MaxStaleness`：行情相对**时点 AsOf** 的最大时效。
+- `Engine.ReplayOne(pf, timeline)` 跑单个组合；`Engine.Replay(pfs, timeline)` 同时跑多个组合。
+
+### 时间推进规则（杜绝未来函数）
+1. **逐时点推进**：时点 `t` 只装载 `[0, t]` 的行情与收益，用于重算风险的收益历史由 `[0,t]` 已实现收益构造；时点 `t` 的风险**绝不引用** `t` 之后的任何数据。
+2. **行情时效以时点为准**：时点 `t` 只接受 `AsOf ≤ t` 且未超 `MaxStaleness` 的行情；时间戳晚于时点的"未来行情"直接以 `INVALID_QUOTE` 拒绝。
+3. **有测试保证**：夹带未来时间戳行情会被拒绝，且其余时点风险与无未来数据基线逐位一致；把时间轴截断后，前序时点风险不随后续数据变化（`TestNoLookahead`）。
+4. **可复现**：收益历史按标的字典序、时点索引顺序对齐累加；多组合并发回放的结果按输入顺序回填，同一份数据无论重跑多少次、goroutine 如何交织，结论逐字段一致（`-race -count=N` 验证）。
+
+### 回测统计口径
+- 时点 `t` 重算出风险阈值后，用**下一期**（`t+1` 收益覆盖区间）真实组合损益 `RealizedPnL = V(t+1) − V(t)` 对照：
+  - **突破（Breach）**：`真实损失(=−RealizedPnL) > VaR`（严格大于，损失与阈值相等不计）。
+- 每个口径独立统计 `MethodStats`：
+  - `EligiblePoints`：有效对照样本数（该时点成功算出风险、存在后续区间、且后续收益完整合法）；
+  - `Breaches`：突破次数；`BreachRate = Breaches / EligiblePoints`；
+  - `WorstLoss`：最差一期亏损（损失为正）。
+- 结论按**口径**区分、按**组合**分别给出（`Report.Portfolios[i].Stats`）。
+
+### 预热、缺失与异常：可区分、不顶替、不伪装正常
+时点级缺陷一律记录为该组合该时点的**显式跳过**（`PointResult.SkipReason` + `Skips` 事件，带明细），不中断整段回放，也绝不用零顶替、不静默吞掉：
+
+| 跳过原因 | 触发条件 |
+|---|---|
+| `WARMUP_INSUFFICIENT` | 截至该时点的干净收益样本数 `< MinHistory` |
+| `MISSING_QUOTE` | 持仓标的在该时点无任何行情 |
+| `STALE_QUOTE` | 最新行情距时点 AsOf 超过 `MaxStaleness` |
+| `INVALID_QUOTE` | 价格 ≤0/NaN/±Inf、空标的、或行情时间戳晚于时点（未来数据） |
+| `DUPLICATE_QUOTE` / `OUT_OF_ORDER` | 该时点某标的行情序号与库内重复 / 倒退；批次内同样检测 |
+| `MISSING_RETURN` / `INVALID_RETURN` | 当期收益缺失 / 为 NaN、±Inf（不以零顶替） |
+| `DEGENERATE_RISK` | 某口径算出 VaR ≤ 0 或非有限值（见下） |
+
+补充约束：
+- **脏收益的对齐方式**：当期（`t`）收益缺失/非法直接跳过该时点；更早历史中的脏数据按"所有持仓标的共同干净的时点索引"取交集对齐剔除，**不以零填充**。
+- **后续区间脏数据不计入统计**：`t+1` 收益缺失/非法时，时点 `t` 的风险照常产出（`NextClean=false`），但不纳入突破统计，避免把缺陷包装成"看着正常"的突破率。
+- **不伪造零风险**：多空相抵、方向接近中性的组合，其历史损益可能恒为 0 或全为盈利，导致损失分位 ≤ 0。此时该时点标 `DEGENERATE_RISK` 并跳过、不进入统计，**绝不输出 VaR=0 的"安全"结论**（`TestNeutralPortfolioNoFakeZero`）。
+- **错误边界**：空时间轴、时间戳非严格递增、空口径、置信水平越界、空组合等**配置/结构问题**直接返回 `error`，整段拒绝；单个组合的时点级数据缺陷只体现在该组合自己的 `Skips/Stats` 中，不影响其他组合（`TestOnePortfolioDefectDoesNotAffectOthers`）。
+- **多组合隔离**：每个组合使用独立行情库、收益缓冲与结果容器，并发互不共享可变状态；多空/规模不同的组合结论与其持仓方向、规模一致，无串扰。
+
 ## 验证方法
 
 ```bash
 go vet ./...
 go test ./... -race -v
+```
+
+### 本地最小示例
+
+```go
+eng, err := backtest.NewEngine(backtest.Config{
+    Methods:      []string{"historical", "parametric"},
+    Confidence:   0.95,
+    MinHistory:   20,        // 至少 20 个干净样本才出风险结论
+    MaxStaleness: 24 * time.Hour,
+})
+if err != nil { /* 配置错误 */ }
+
+timeline := []backtest.Point{ /* 按 AsOf 严格递增装载各时点行情与当期收益 */ }
+report, err := eng.Replay([]*portfolio.Portfolio{pf1, pf2}, timeline)
+for _, s := range report.Portfolios {
+    for _, st := range s.Stats { // 按口径查看
+        fmt.Printf("%s/%s: 有效=%d 突破=%d 比例=%.2f%% 最差亏损=%.2f\n",
+            s.Portfolio, st.Method, st.EligiblePoints, st.Breaches,
+            st.BreachRate*100, st.WorstLoss)
+    }
+    fmt.Println("跳过事件:", s.SkipsByReason()) // 任何跳过都显式可见
+}
 ```
 
 测试覆盖：
@@ -67,5 +139,12 @@ go test ./... -race -v
 - **增量 vs 全量一致性**：逐条更新（混入重复与乱序）与一次性装载的 VaR/ES 差值在 1e-9 容差内。
 - **可复现性**：同一损益序列两次历史模拟结果逐位相等；参数法 99% 分位对标标准正态理论值 2.3263。
 - **压力情景**：受压 VaR 相对基准上升，且基础行情不被污染。
+- **回放预热**：干净样本不足 `MinHistory` 的前置时点全部以 `WARMUP_INSUFFICIENT` 跳过且不计入统计。
+- **回放行情缺陷**：缺失 / 过期 / 非法（含未来时间戳）/ 重复序号 / 序号倒退分别断言不同 `SkipReason`，且被拒时点不污染后续时点。
+- **回放收益缺陷**：当期收益缺失 / NaN 显式跳过、不以零顶替，恢复后按干净索引对齐重算。
+- **回测突破统计**：植入两期极端冲击，断言突破次数、突破比例与最差一期亏损的精确值，历史法与参数法分别核对。
+- **可复现 / 无未来函数**：同数据重跑逐字段一致；夹带未来行情被拒、截断时间轴前序结论不变。
+- **多组合并发**：多空与不同规模组合并发回放，5 轮并发与串行基线逐位一致、`-race` 通过、无串扰。
+- **中性组合不造假**：完全对冲组合预热后各点全部 `DEGENERATE_RISK`，绝不产出 VaR=0 的正常结论，有效样本为 0。
 
 所有单测日志均打印**输入快照**（持仓、价格、序号、时间戳）与**判定依据**（期望原因、实际结果、容差），便于审计与复现。

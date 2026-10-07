@@ -94,12 +94,19 @@ func (e *Engine) currentWeights(snap map[string]market.Quote) (map[string]float6
 }
 
 // pnlSeries 由权重与历史收益构造组合历史损益序列（货币单位）。
+// 按标的字典序累加，避免 map 遍历顺序随机导致浮点结果不可逐位复现。
 func (e *Engine) pnlSeries(weights map[string]float64, value float64) ([]float64, error) {
 	if e.n == 0 {
 		return nil, fmt.Errorf("no return history configured")
 	}
+	syms := make([]string, 0, len(weights))
+	for sym := range weights {
+		syms = append(syms, sym)
+	}
+	sort.Strings(syms)
 	pnl := make([]float64, e.n)
-	for sym, w := range weights {
+	for _, sym := range syms {
+		w := weights[sym]
 		r, ok := e.returns[sym]
 		if !ok {
 			return nil, fmt.Errorf("missing return history for symbol: %s", sym)
@@ -148,7 +155,13 @@ func (e *Engine) Stress(sc StressScenario, confidence float64) (Result, error) {
 		return Result{}, err
 	}
 	var shockPnL float64
-	for sym, shock := range sc {
+	scSyms := make([]string, 0, len(sc))
+	for sym := range sc {
+		scSyms = append(scSyms, sym)
+	}
+	sort.Strings(scSyms)
+	for _, sym := range scSyms {
+		shock := sc[sym]
 		ww, ok := w[sym]
 		if !ok {
 			return Result{}, fmt.Errorf("stress scenario references symbol %q not held by portfolio %q", sym, e.pf.Name)
